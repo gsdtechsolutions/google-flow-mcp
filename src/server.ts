@@ -457,6 +457,8 @@ export function createGoogleFlowServer(config: Config) {
           index: buttonIndex,
           allowCreditSpend: true,
         });
+        // The flow.google.com assistant may ask "kick off this generation, costing N credits?"; the user already approved.
+        await flow.approveCreditPrompt();
         const updated = await store.updateJob(job.id, { state: "submitted", error: undefined, submittedAt: new Date().toISOString() });
         return response({ job: updated, reused: false, page });
       } catch (error) {

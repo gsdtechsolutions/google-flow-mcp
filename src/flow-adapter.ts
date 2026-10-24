@@ -12,7 +12,9 @@ import type { AuthRecord, FlowMediaItem, PageInspection } from "./types.js";
 const FLOW_URL = "https://flow.google.com/";
 const FLOW_HOSTS = new Set(["flow.google.com", "labs.google"]);
 const isAssetMedia = (media: FlowMediaItem) => new URL(media.href).pathname.startsWith("/asb/");
-const CREDIT_ACTION = /^(generate|create|生成|制作|产生)(\s|$)/i;
+const CREDIT_ACTION = /^(generate|create|approve|生成|制作|产生)(\s|$)/i;
+// Would disable Flow's per-generation credit confirmation for the whole account.
+const BLOCKED_CREDIT_ACTION = /always approve/i;
 const BLOCKED_AUTH_ACTION = /(password|passkey|verification|验证码|验证|sign\s*out|log\s*out|退出登录|登出)/i;
 
 type VisibleControl = { locator: Locator; label: string; frame: number };
@@ -209,6 +211,15 @@ export class FlowBrowserAdapter {
     return this.inspectPage();
   }
 
+  async approveCreditPrompt(): Promise<boolean> {
+    const page = await this.ensurePage();
+    const approve = page.getByRole("button", { name: /^\s*(check\s+)?approve\s*$/i }).last();
+    // shortcut: waits up to 20s even when no prompt comes (image jobs); switch to watching the assistant reply if that delay matters.
+    const appeared = await approve.waitFor({ state: "visible", timeout: 20_000 }).then(() => true, () => false);
+    if (appeared) await approve.click();
+    return appeared;
+  }
+
   async clickControl(input: { label?: string; index?: number; allowCreditSpend: boolean }): Promise<PageInspection> {
     const controls = await this.visibleControls("button, [role='button'], a[href], [tabindex]:not([tabindex='-1']), summary, input[type='button'], input[type='submit']");
     let target: VisibleControl;
@@ -220,6 +231,7 @@ export class FlowBrowserAdapter {
       target = textMatches[0];
     }
     if (BLOCKED_AUTH_ACTION.test(target.label)) throw new Error("Signing out and credential-related actions are user-only.");
+    if (BLOCKED_CREDIT_ACTION.test(target.label)) throw new Error("Blanket credit approval is user-only.");
     if (CREDIT_ACTION.test(target.label) && !input.allowCreditSpend) throw new Error("This control may spend Google Flow credits. Set allowCreditSpend=true only after user approval.");
     await target.locator.click();
     await this.page?.waitForLoadState("domcontentloaded", { timeout: 10_000 }).catch(() => undefined);
@@ -251,8 +263,9 @@ export class FlowBrowserAdapter {
     const { media } = await this.openMedia(input);
     const page = await this.ensurePage();
     if (isAssetMedia(media)) {
-      // =d asks for the original file (same bytes as the editor's Download menu).
-      const response = await page.request.get(`${media.href}=d`);
+      // Images: =d is the original file. Videos: =m22 is 720p MP4, =m18 is the 360p fallback (bare URL returns a JPEG poster).
+      let response = await page.request.get(`${media.href}${media.kind === "video" ? "=m22" : "=d"}`);
+      if (media.kind === "video" && !response.ok()) response = await page.request.get(`${media.href}=m18`);
       if (!response.ok()) throw new Error(`Flow media download failed with HTTP ${response.status()}.`);
       const extension = (response.headers()["content-type"] ?? "").split(";")[0].split("/")[1]?.replace("jpeg", "jpg") || "bin";
       const suggestedFileName = `${media.tileId.slice(0, 24)}.${extension}`;
@@ -349,9 +362,12 @@ export class FlowBrowserAdapter {
       const href = new URL(element.getAttribute("src") ?? "", location.origin);
       href.pathname = href.pathname.replace(/=[^/]*$/, "");
       const tileId = href.pathname.split("/").at(-1) ?? "";
-      const kind = element.tagName === "VIDEO" ? "video" as const : "image" as const;
-      return { tileId, providerMediaId: tileId, title: element.getAttribute("alt") || tileId, kind, href: `${href.origin}${href.pathname}` };
+      const alt = element.getAttribute("alt") ?? "";
+      const kind = element.tagName === "VIDEO" || /video/i.test(alt) ? "video" as const : "image" as const;
+      return { tileId, providerMediaId: tileId, title: alt || tileId, kind, href: `${href.origin}${href.pathname}` };
     })));
+    // A video tile also renders a poster <img>; the Map below keeps the last entry per href, so videos go last.
+    results.sort((a, b) => Number(a.kind === "video") - Number(b.kind === "video"));
     return [...new Map(results.map((item) => [item.href, item])).values()];
   }
 
