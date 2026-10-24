@@ -5,6 +5,9 @@ import { spawnSync } from "node:child_process";
 
 import type { Config } from "./config.js";
 import { FlowBrowserAdapter } from "./flow-adapter.js";
+import {
+  ASPECT_RATIOS, assertWithinCreditLimit, DURATIONS, IMAGE_MODELS, RESOLUTIONS, settingsErrors, VIDEO_MODELS,
+} from "./flow-settings.js";
 import { sha256File, validateMedia } from "./media-validator.js";
 import { StateStore } from "./state.js";
 
@@ -27,6 +30,7 @@ export function createGoogleFlowServer(config: Config) {
         "Never ask for, read, type, store, or repeat passwords, verification codes, recovery answers, or 2FA tokens.",
         "Call flow_inspect_page before filling or clicking controls.",
         "Generation submission requires explicit user approval because it may spend credits.",
+        "Before each generation call flow_configure_generation; settings are shared and sticky across sessions.",
       ].join(" "),
     },
   );
@@ -229,6 +233,76 @@ export function createGoogleFlowServer(config: Config) {
     }
   };
 
+  const linkedFlowUrl = async (projectId: string) => {
+    await projectGuard(projectId);
+    const project = (await store.read()).projects.find((item) => item.id === projectId)!;
+    if (!project.flowProjectUrl) throw new Error("Project has no linked Google Flow URL.");
+    return project.flowProjectUrl;
+  };
+
+  server.registerTool(
+    "flow_configure_generation",
+    {
+      title: "Configure Google Flow generation settings",
+      description: "Turn Agent mode off and explicitly set type, model, aspect ratio, outputs, and video options in the prompt-box settings. Returns the settings summary and the credit cost Flow shows.",
+      inputSchema: z.object({
+        projectId: z.string().uuid(),
+        type: z.enum(["image", "video"]),
+        model: z.enum([...IMAGE_MODELS, ...VIDEO_MODELS]),
+        aspectRatio: z.enum(ASPECT_RATIOS),
+        outputs: z.number().int().min(1).max(4),
+        videoMode: z.enum(["frames", "ingredients"]).optional(),
+        durationSeconds: z.union(DURATIONS.map((value) => z.literal(value))).optional(),
+        resolution: z.enum(RESOLUTIONS).optional(),
+      }).superRefine((value, context) => {
+        for (const message of settingsErrors(value)) context.addIssue({ code: "custom", message });
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ projectId, ...settings }) => response(await flow.configureGeneration(await linkedFlowUrl(projectId), settings)),
+  );
+
+  server.registerTool(
+    "flow_list_characters",
+    {
+      title: "List Google Flow characters",
+      description: "List the characters in the linked Flow project with their ids and editor URLs.",
+      inputSchema: z.object({ projectId: z.string().uuid() }),
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ projectId }) => response({ characters: await flow.listCharacters(await linkedFlowUrl(projectId)) }),
+  );
+
+  server.registerTool(
+    "flow_create_character",
+    {
+      title: "Create a Google Flow character from an image",
+      description: "Upload one local image on the Characters page, accept the image-rights notice, set the name and optional character info. Uses no credits and never assigns a voice.",
+      inputSchema: z.object({
+        projectId: z.string().uuid(),
+        name: z.string().trim().min(1).max(100),
+        imagePath: z.string().min(1),
+        description: z.string().trim().min(1).max(2000).optional(),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ projectId, ...input }) => response(await flow.createCharacter({ projectUrl: await linkedFlowUrl(projectId), ...input })),
+  );
+
+  server.registerTool(
+    "flow_list_tools",
+    {
+      title: "List Google Flow tools",
+      description: "Read the tool cards on the Flow Tools page for one tab. Read-only: never opens, remixes, shares, or runs a tool.",
+      inputSchema: z.object({
+        projectId: z.string().uuid(),
+        tab: z.enum(["community", "templates", "mine"]).default("community"),
+      }),
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ projectId, tab }) => response({ tab, tools: await flow.listTools(await linkedFlowUrl(projectId), tab) }),
+  );
+
   server.registerTool(
     "flow_fill_text",
     {
@@ -384,7 +458,7 @@ export function createGoogleFlowServer(config: Config) {
     "flow_prepare_generation",
     {
       title: "Prepare a Google Flow generation",
-      description: "Create an idempotent job and fill the prompt, but do not click a generation control or spend credits.",
+      description: "Create an idempotent job and fill the prompt, but do not click a generation control or spend credits. Each @Name in the prompt becomes a real Flow mention of the asset or character with that exact name.",
       inputSchema: z.object({
         projectId: z.string().uuid(),
         operation: z.enum(["image", "video"]),
@@ -410,7 +484,7 @@ export function createGoogleFlowServer(config: Config) {
       if (created.reused) return response(created);
       try {
         const baselinePage = await flow.inspectPage();
-        const page = await flow.fillTextbox({
+        const page = await flow.fillPrompt({
           text: input.prompt,
           label: input.textboxLabel,
           index: input.textboxIndex,
@@ -431,18 +505,19 @@ export function createGoogleFlowServer(config: Config) {
     "flow_submit_generation",
     {
       title: "Submit a prepared Google Flow generation",
-      description: "Click the selected generation control and mark the job submitted. Explicit user approval is mandatory because credits may be spent.",
+      description: "Re-read the credit cost from Flow settings, refuse when it exceeds maxCredits or cannot be read, otherwise click the selected generation control and mark the job submitted. Explicit user approval is mandatory because credits may be spent.",
       inputSchema: z.object({
         jobId: z.string().uuid(),
         buttonLabel: z.string().optional(),
         buttonIndex: z.number().int().nonnegative().optional(),
         userApprovedCreditSpend: z.literal(true),
+        maxCredits: z.number().int().nonnegative(),
       }).refine((value) => value.buttonLabel !== undefined || value.buttonIndex !== undefined, {
         message: "Provide buttonLabel or buttonIndex from flow_inspect_page.",
       }),
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     },
-    async ({ jobId, buttonLabel, buttonIndex }) => {
+    async ({ jobId, buttonLabel, buttonIndex, maxCredits }) => {
       const state = await store.read();
       const job = state.jobs.find((item) => item.id === jobId);
       if (!job) throw new Error(`Job not found: ${jobId}`);
@@ -451,16 +526,20 @@ export function createGoogleFlowServer(config: Config) {
       }
       if (job.state !== "prepared") throw new Error(`Job must be prepared before submission; current state is ${job.state}.`);
       await projectGuard(job.projectId);
+      // Read right before clicking: settings are shared, so another session may have changed them.
+      const credits = await flow.readGenerationCredits();
+      assertWithinCreditLimit(credits, maxCredits);
       try {
         const page = await flow.clickControl({
           label: buttonLabel,
           index: buttonIndex,
           allowCreditSpend: true,
+          creditsChecked: true,
         });
         // The flow.google.com assistant may ask "kick off this generation, costing N credits?"; the user already approved.
         await flow.approveCreditPrompt();
         const updated = await store.updateJob(job.id, { state: "submitted", error: undefined, submittedAt: new Date().toISOString() });
-        return response({ job: updated, reused: false, page });
+        return response({ job: updated, reused: false, credits, page });
       } catch (error) {
         await store.updateJob(job.id, { state: "failed", error: (error as Error).message });
         throw error;

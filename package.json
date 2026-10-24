@@ -34,7 +34,7 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsc -p tsconfig.json && node dist/src/index.js",
     "start": "node dist/src/index.js",
-    "test": "npm run build && node --test dist/test/state.test.js dist/test/server.test.js dist/test/stdio.test.js",
+    "test": "npm run build && node --test dist/test/state.test.js dist/test/server.test.js dist/test/stdio.test.js dist/test/flow-settings.test.js",
     "check": "tsc -p tsconfig.json --noEmit",
     "prepublishOnly": "npm run check && npm test",
     "prepack": "npm run build",

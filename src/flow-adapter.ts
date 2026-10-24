@@ -6,6 +6,7 @@ import { chromium, type BrowserContext, type Download, type Locator, type Page }
 
 import type { Config } from "./config.js";
 import { StateStore } from "./state.js";
+import { matchMention, MODEL_RULES, parseCreditLine, type GenerationSettings } from "./flow-settings.js";
 import type { AuthRecord, FlowMediaItem, PageInspection } from "./types.js";
 
 // Flow moved from labs.google/fx/tools/flow to flow.google.com; old URLs redirect.
@@ -15,9 +16,55 @@ const isAssetMedia = (media: FlowMediaItem) => new URL(media.href).pathname.star
 const CREDIT_ACTION = /^(generate|create|approve|生成|制作|产生)(\s|$)/i;
 // Would disable Flow's per-generation credit confirmation for the whole account.
 const BLOCKED_CREDIT_ACTION = /always approve/i;
+// Only flow_submit_generation may press this, because it checks the credit line against maxCredits first.
+const SUBMIT_ONLY_ACTION = /^start generation$/i;
 const BLOCKED_AUTH_ACTION = /(password|passkey|verification|验证码|验证|sign\s*out|log\s*out|退出登录|登出)/i;
 
+// Verified against flow.google.com in 2026-10 (Agent mode off).
+const SELECTORS = {
+  overlay: ".cdk-overlay-container",
+  agentChip: "button.agent-mode-chip",
+  agentPanelClose: "button[aria-label='Close']",
+  settingsTrigger: "button[aria-label='Settings trigger']",
+  radio: "button[role=radio]",
+  modelMenu: "button[aria-label='Select model family']",
+  menuItem: "[role=menuitem], [role=menuitemradio]",
+  mentionSearch: "input[aria-label='Search assets']",
+  mentionOption: "[role=option]",
+  mentionTitle: ".asset-title",
+  mentionAdd: /^\s*Add to prompt\s*$/,
+  mentionChip: ".mention-chip",
+  charactersNav: "button",
+  charactersNavText: /^\s*accessibility_new\s*Characters\s*$/,
+  characterTile: "flow-character-tile",
+  characterName: ".character-tile-name",
+  characterThumbnail: "img.character-tile-thumbnail",
+  editName: "button[aria-label='Edit name']",
+  nameInput: "input[aria-label='Character name']",
+  characterInfo: "textarea[aria-label='Character personality']",
+  toolSection: "section.applet-section",
+  toolSectionTitle: ".section-title",
+  toolCard: ".applet-card",
+  toolName: ".applet-name",
+  toolAuthor: ".applet-author",
+  toolDescription: ".applet-description",
+  toolThumbnail: ".applet-preview-image",
+} as const;
+const TOOL_TABS = { community: "Community", templates: "Templates", mine: "My Tools" } as const;
+const CHARACTER_URL = /\/character\/([0-9a-f-]{36})/;
+const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+export type FlowCharacter = { id: string; name: string; url: string };
+export type FlowTool = { name: string; author: string; description: string; section: string; thumbnail: string };
+
 type VisibleControl = { locator: Locator; label: string; frame: number };
+
+const projectBaseUrl = (projectUrl: string) => {
+  const url = new URL(projectUrl);
+  const match = url.pathname.match(/^\/project\/[^/]+/);
+  if (url.hostname !== "flow.google.com" || !match) throw new Error("This action needs a flow.google.com project URL.");
+  return `${url.origin}${match[0]}`;
+};
 
 export class FlowBrowserAdapter {
   private context?: BrowserContext;
@@ -220,7 +267,7 @@ export class FlowBrowserAdapter {
     return appeared;
   }
 
-  async clickControl(input: { label?: string; index?: number; allowCreditSpend: boolean }): Promise<PageInspection> {
+  async clickControl(input: { label?: string; index?: number; allowCreditSpend: boolean; creditsChecked?: boolean }): Promise<PageInspection> {
     const controls = await this.visibleControls("button, [role='button'], a[href], [tabindex]:not([tabindex='-1']), summary, input[type='button'], input[type='submit']");
     let target: VisibleControl;
     try { target = this.chooseControl(controls, input.label, input.index, "button"); }
@@ -232,6 +279,7 @@ export class FlowBrowserAdapter {
     }
     if (BLOCKED_AUTH_ACTION.test(target.label)) throw new Error("Signing out and credential-related actions are user-only.");
     if (BLOCKED_CREDIT_ACTION.test(target.label)) throw new Error("Blanket credit approval is user-only.");
+    if (SUBMIT_ONLY_ACTION.test(target.label) && !input.creditsChecked) throw new Error("Use flow_submit_generation with maxCredits to start a generation.");
     if (CREDIT_ACTION.test(target.label) && !input.allowCreditSpend) throw new Error("This control may spend Google Flow credits. Set allowCreditSpend=true only after user approval.");
     await target.locator.click();
     await this.page?.waitForLoadState("domcontentloaded", { timeout: 10_000 }).catch(() => undefined);
@@ -294,11 +342,208 @@ export class FlowBrowserAdapter {
     return { ...saved, media, bytes: (await stat(saved.path)).size };
   }
 
+  async configureGeneration(projectUrl: string, settings: GenerationSettings): Promise<{ summary: string; credits: number }> {
+    const page = await this.openProjectPage(projectUrl);
+    await this.turnAgentOff(page);
+    const overlay = page.locator(SELECTORS.overlay);
+    await this.openSettings(page);
+    await this.chooseRadio(page, settings.type === "image" ? "Image" : "Video");
+    const menu = overlay.locator(SELECTORS.modelMenu);
+    if (!(await menu.innerText()).includes(settings.model)) {
+      await menu.click();
+      const item = overlay.locator(SELECTORS.menuItem).filter({ hasText: settings.model });
+      if (await item.count() !== 1) throw new Error(`Flow model menu has ${await item.count()} items named "${settings.model}".`);
+      await item.click();
+      await page.waitForTimeout(1_200);
+      await this.openSettings(page);
+      if (!(await menu.innerText()).includes(settings.model)) throw new Error(`Flow did not switch the model to ${settings.model}.`);
+    }
+    if (settings.type === "video") await this.chooseRadio(page, settings.videoMode === "frames" ? "Frames" : "Ingredients");
+    await this.chooseRadio(page, settings.aspectRatio);
+    const rule = MODEL_RULES[settings.model];
+    // Single-option settings (Veo is fixed at 8s/720p) have no control in the popover.
+    if (settings.resolution && (rule.resolutions?.length ?? 0) > 1) await this.chooseRadio(page, settings.resolution);
+    if (settings.durationSeconds && (rule.durations?.length ?? 0) > 1) await this.chooseRadio(page, `${settings.durationSeconds}s`);
+    await this.chooseRadio(page, `x${settings.outputs}`);
+    const credits = parseCreditLine(await overlay.innerText());
+    await this.closeSettings(page);
+    if (credits === undefined) throw new Error("Flow settings did not show a \"Generating will use N credits\" line.");
+    const summary = (await page.locator(SELECTORS.settingsTrigger).innerText()).replace(/\s+/g, " ").trim();
+    return { summary, credits };
+  }
+
+  // Reads the live credit line; undefined when it is not visible (for example with Agent mode on).
+  async readGenerationCredits(): Promise<number | undefined> {
+    const page = await this.ensurePage();
+    if (!(await page.locator(SELECTORS.settingsTrigger).isVisible().catch(() => false))) return undefined;
+    await this.openSettings(page);
+    const credits = parseCreditLine(await page.locator(SELECTORS.overlay).innerText());
+    await this.closeSettings(page);
+    return credits;
+  }
+
+  async fillPrompt(input: { text: string; label?: string; index?: number }): Promise<PageInspection> {
+    const parts = input.text.split(/(?<=^|\s)@(?=\S)/);
+    if (parts.length === 1) return this.fillTextbox(input);
+    const page = await this.ensurePage();
+    const controls = await this.visibleControls("textarea, input[type='text'], input:not([type]), [contenteditable='true'], [role='textbox']");
+    const target = this.chooseControl(controls, input.label, input.index, "textbox");
+    await target.locator.fill("");
+    // insertText never sends Enter, which would submit the prompt.
+    if (parts[0]) await page.keyboard.insertText(parts[0]);
+    const overlay = page.locator(SELECTORS.overlay);
+    for (const part of parts.slice(1)) {
+      await page.keyboard.type("@");
+      const search = overlay.locator(SELECTORS.mentionSearch);
+      await search.waitFor({ state: "visible", timeout: 10_000 });
+      const firstWord = part.match(/^[^\s]+/)![0];
+      await search.fill(firstWord);
+      await page.waitForTimeout(1_500);
+      const titles = await overlay.locator(`${SELECTORS.mentionOption} ${SELECTORS.mentionTitle}`).allInnerTexts();
+      const name = matchMention(part, titles.map((title) => title.trim()));
+      if (!name) {
+        await page.keyboard.press("Escape");
+        throw new Error(`No Flow asset or character named "@${firstWord}..." for this mention. Known matches: ${titles.join(", ") || "none"}.`);
+      }
+      await search.fill(name);
+      await page.waitForTimeout(1_000);
+      const option = overlay.locator(SELECTORS.mentionOption).filter({ has: page.locator(SELECTORS.mentionTitle, { hasText: new RegExp(`^\\s*${escapeRegExp(name)}\\s*$`) }) });
+      if (await option.count() < 1) throw new Error(`Flow mention option "${name}" disappeared.`);
+      // Clicking an option only previews it; "Add to prompt" inserts the previewed item.
+      await option.first().click();
+      await overlay.getByRole("button", { name: SELECTORS.mentionAdd }).click();
+      await page.waitForTimeout(800);
+      const chip = (await target.locator.locator(SELECTORS.mentionChip).last().textContent().catch(() => ""))?.trim();
+      if (chip !== name) throw new Error(`Flow inserted mention "${chip}" instead of "${name}".`);
+      // Flow inserts a space after the chip.
+      const rest = part.slice(name.length).replace(/^ /, "");
+      if (rest) await page.keyboard.insertText(rest);
+    }
+    return this.inspectPage();
+  }
+
+  async listCharacters(projectUrl: string): Promise<FlowCharacter[]> {
+    const page = await this.ensurePage();
+    const characters: FlowCharacter[] = [];
+    for (let index = 0; ; index += 1) {
+      await this.openProjectPage(projectUrl, true);
+      await page.locator(SELECTORS.charactersNav).filter({ hasText: SELECTORS.charactersNavText }).click();
+      await page.waitForTimeout(3_000);
+      const tiles = page.locator(SELECTORS.characterTile);
+      if (index >= await tiles.count()) return characters;
+      const name = (await tiles.nth(index).locator(SELECTORS.characterName).innerText()).trim();
+      await tiles.nth(index).locator(SELECTORS.characterThumbnail).click();
+      await page.waitForURL(CHARACTER_URL, { timeout: 30_000 });
+      characters.push({ id: page.url().match(CHARACTER_URL)![1], name, url: page.url().split("?")[0] });
+    }
+  }
+
+  async createCharacter(input: { projectUrl: string; name: string; imagePath: string; description?: string }): Promise<FlowCharacter> {
+    const imagePath = path.resolve(input.imagePath);
+    if (!(await stat(imagePath).catch(() => undefined))?.isFile()) throw new Error(`Image file not found: ${imagePath}`);
+    const page = await this.ensurePage();
+    await page.goto(`${projectBaseUrl(input.projectUrl)}/character`, { waitUntil: "domcontentloaded", timeout: 45_000 });
+    const upload = page.getByRole("button", { name: /^\s*(upload\s*)?Upload\s*$/ });
+    await upload.waitFor({ state: "visible", timeout: 30_000 });
+    const [chooser] = await Promise.all([page.waitForEvent("filechooser", { timeout: 15_000 }), upload.click()]);
+    await chooser.setFiles(imagePath);
+    const agree = page.locator(SELECTORS.overlay).getByRole("button", { name: /^\s*I agree\s*$/ });
+    if (await agree.waitFor({ state: "visible", timeout: 15_000 }).then(() => true, () => false)) await agree.click();
+    await page.waitForURL(CHARACTER_URL, { timeout: 90_000 });
+    await page.locator(SELECTORS.editName).click();
+    const nameInput = page.locator(SELECTORS.nameInput);
+    await nameInput.fill(input.name);
+    await nameInput.press("Enter");
+    if (input.description) await page.locator(SELECTORS.characterInfo).fill(input.description);
+    await page.waitForTimeout(1_500);
+    const character = { id: page.url().match(CHARACTER_URL)![1], name: input.name, url: page.url().split("?")[0] };
+    await page.getByRole("button", { name: /^\s*Done\s*$/ }).click();
+    await page.waitForTimeout(3_000);
+    return character;
+  }
+
+  async listTools(projectUrl: string, tab: keyof typeof TOOL_TABS): Promise<FlowTool[]> {
+    const page = await this.ensurePage();
+    await page.goto(`${projectBaseUrl(projectUrl)}/tools`, { waitUntil: "domcontentloaded", timeout: 45_000 });
+    const tabRadio = page.locator(SELECTORS.radio).filter({ hasText: new RegExp(`^\\s*${TOOL_TABS[tab]}\\s*$`) });
+    await tabRadio.waitFor({ state: "visible", timeout: 30_000 });
+    await tabRadio.click();
+    await page.waitForTimeout(5_000);
+    const { toolCard, toolSectionTitle, toolName, toolAuthor, toolDescription, toolThumbnail } = SELECTORS;
+    return page.locator(SELECTORS.toolSection).evaluateAll((sections, selectors) => sections.flatMap((section) => {
+      const text = (root: Element, selector: string) => root.querySelector(selector)?.textContent?.replace(/\s+/g, " ").trim() ?? "";
+      return [...section.querySelectorAll(selectors.toolCard)].map((card) => ({
+        name: text(card, selectors.toolName),
+        author: text(card, selectors.toolAuthor),
+        description: text(card, selectors.toolDescription),
+        section: text(section, selectors.toolSectionTitle),
+        thumbnail: card.querySelector<HTMLImageElement>(selectors.toolThumbnail)?.src ?? "",
+      }));
+    }), { toolCard, toolSectionTitle, toolName, toolAuthor, toolDescription, toolThumbnail });
+  }
+
   async close(): Promise<void> {
     const context = this.context;
     this.context = undefined;
     this.page = undefined;
     await context?.close();
+  }
+
+  private async openProjectPage(projectUrl: string, force = false): Promise<Page> {
+    this.validateFlowProjectUrl(projectUrl);
+    const page = await this.ensurePage();
+    if (force || page.url().split("?")[0] !== projectUrl.split("?")[0]) {
+      await page.goto(projectUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
+    }
+    await page.locator(`${SELECTORS.settingsTrigger}, ${SELECTORS.agentChip}, ${SELECTORS.agentPanelClose}`).first().waitFor({ state: "visible", timeout: 30_000 });
+    await page.waitForTimeout(1_500);
+    return page;
+  }
+
+  private async turnAgentOff(page: Page): Promise<void> {
+    const chip = page.locator(SELECTORS.agentChip);
+    // The agent chat panel hides the Agent chip until it is closed.
+    if (!(await chip.isVisible().catch(() => false))) {
+      await page.locator(SELECTORS.agentPanelClose).first().click();
+      await chip.waitFor({ state: "visible", timeout: 10_000 });
+    }
+    if ((await chip.getAttribute("aria-pressed")) === "true") await chip.click();
+    await page.locator(SELECTORS.settingsTrigger).waitFor({ state: "visible", timeout: 10_000 });
+  }
+
+  private async settingsOpen(page: Page): Promise<boolean> {
+    return parseCreditLine(await page.locator(SELECTORS.overlay).innerText().catch(() => "")) !== undefined;
+  }
+
+  private async openSettings(page: Page): Promise<void> {
+    if (await this.settingsOpen(page)) return;
+    await page.locator(SELECTORS.settingsTrigger).click();
+    await page.waitForTimeout(1_200);
+    if (!(await this.settingsOpen(page))) throw new Error("Flow settings popover did not open.");
+  }
+
+  // A backdrop click does not reliably close the popover; Escape or a second trigger click does.
+  private async closeSettings(page: Page): Promise<void> {
+    if (!(await this.settingsOpen(page))) return;
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(700);
+    if (await this.settingsOpen(page)) await page.locator(SELECTORS.settingsTrigger).click();
+    await page.waitForTimeout(700);
+    if (await this.settingsOpen(page)) throw new Error("Flow settings popover did not close.");
+  }
+
+  private async chooseRadio(page: Page, label: string): Promise<void> {
+    const radios = page.locator(SELECTORS.overlay).locator(SELECTORS.radio);
+    // Radio text is an icon name plus the label (and sometimes an info icon), one per line.
+    const matches = await radios.evaluateAll((elements, wanted) => elements.flatMap((element, index) =>
+      (element as HTMLElement).innerText.split("\n").some((line) => line.trim() === wanted) ? [index] : []), label);
+    if (matches.length !== 1) throw new Error(`Expected one Flow setting "${label}", found ${matches.length}.`);
+    const radio = radios.nth(matches[0]);
+    if ((await radio.getAttribute("aria-checked")) !== "true") {
+      await radio.click();
+      await page.waitForTimeout(600);
+    }
+    if ((await radio.getAttribute("aria-checked")) !== "true") throw new Error(`Flow did not select setting "${label}".`);
   }
 
   private async ensurePage(): Promise<Page> {
