@@ -202,8 +202,10 @@ export class FlowBrowserAdapter {
     while (Date.now() <= deadline) {
       observations += 1;
       inspection = await this.inspectPage();
-      const created = inspection.media.find((item) =>
-        item.kind === input.expectedKind && !baseline.has(item.tileId) && (!item.providerMediaId || !baseline.has(item.providerMediaId)));
+      // Flow lists newest first and lazy-loads tiles, so an old tile can first appear after the baseline was taken.
+      // Only the topmost tile of the wanted kind can be the new result.
+      const newest = inspection.media.find((item) => item.kind === input.expectedKind);
+      const created = newest && !baseline.has(newest.tileId) && (!newest.providerMediaId || !baseline.has(newest.providerMediaId)) ? newest : undefined;
       if (created) return { status: "complete", media: created, observations, page: inspection };
       failedObservations = inspection.failureCount > input.baselineFailureCount ? failedObservations + 1 : 0;
       if (failedObservations >= 3) return { status: "failed", observations, page: inspection };
