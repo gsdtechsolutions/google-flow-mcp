@@ -9,6 +9,7 @@ import {
   ASPECT_RATIOS, assertWithinCreditLimit, DURATIONS, IMAGE_MODELS, RESOLUTIONS, settingsErrors, VIDEO_MODELS,
 } from "./flow-settings.js";
 import { sha256File, validateMedia } from "./media-validator.js";
+import { FlowMusicAdapter } from "./music-adapter.js";
 import { StateStore } from "./state.js";
 
 function response(value: unknown) {
@@ -21,6 +22,7 @@ function response(value: unknown) {
 export function createGoogleFlowServer(config: Config) {
   const store = new StateStore(config.databaseFile ?? config.stateFile, config.stateFile);
   const flow = new FlowBrowserAdapter(config, store);
+  const music = new FlowMusicAdapter(() => flow.newPage());
   const server = new McpServer(
     { name: "google-flow-browser", version: "1.0.0" },
     {
@@ -301,6 +303,57 @@ export function createGoogleFlowServer(config: Config) {
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
     async ({ projectId, tab }) => response({ tab, tools: await flow.listTools(await linkedFlowUrl(projectId), tab) }),
+  );
+
+  server.registerTool(
+    "music_generate",
+    {
+      title: "Generate a song in Flow Music",
+      description: "Send a prompt to the Flow Music producer (flowmusic.app) and wait up to timeoutSeconds for the song. Free in testing. Returns sessionUrl, status, song titles and the producer's text; if status is generating or empty, poll music_status. Flow Music has its own sign-in.",
+      inputSchema: z.object({
+        prompt: z.string().min(10),
+        timeoutSeconds: z.number().int().min(10).max(300).default(45),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ prompt, timeoutSeconds }) => {
+      const creditsBefore = await music.credits();
+      const session = await music.generate(prompt, timeoutSeconds);
+      return response({ ...session, creditsBefore, creditsAfter: await music.credits() });
+    },
+  );
+
+  server.registerTool(
+    "music_status",
+    {
+      title: "Read a Flow Music session",
+      description: "Open a Flow Music session URL and report whether its songs are done, waiting up to timeoutSeconds. Read-only.",
+      inputSchema: z.object({
+        sessionUrl: z.string().url(),
+        timeoutSeconds: z.number().int().min(10).max(300).default(45),
+      }),
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ sessionUrl, timeoutSeconds }) => response(await music.inspect(sessionUrl, timeoutSeconds)),
+  );
+
+  server.registerTool(
+    "music_download",
+    {
+      title: "Download a Flow Music song as MP3",
+      description: "Download one finished song from a Flow Music session as MP3 (default: the newest song). Validate it with media_validate_local afterwards.",
+      inputSchema: z.object({
+        sessionUrl: z.string().url(),
+        title: z.string().optional(),
+        destinationDir: z.string().min(1),
+        fileName: z.string().min(1),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async (input) => {
+      const filePath = await music.download(input);
+      return response({ filePath, sha256: await sha256File(filePath) });
+    },
   );
 
   server.registerTool(

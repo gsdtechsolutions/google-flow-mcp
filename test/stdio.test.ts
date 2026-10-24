@@ -41,7 +41,7 @@ test("stdio client discovers the expected MCP tools", async () => {
     ]) {
       assert.ok(names.has(expected), `missing tool: ${expected}`);
     }
-    assert.equal(tools.length, 26);
+    assert.equal(tools.length, 29);
     const submit = tools.find((tool) => tool.name === "flow_submit_generation")!;
     assert.ok(submit.inputSchema.required?.includes("maxCredits"), "flow_submit_generation requires maxCredits");
   } finally {

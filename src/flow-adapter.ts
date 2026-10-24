@@ -484,6 +484,12 @@ export class FlowBrowserAdapter {
     }), { toolCard, toolSectionTitle, toolName, toolAuthor, toolDescription, toolThumbnail });
   }
 
+  /** A fresh tab in the signed-in profile, for sibling apps such as Flow Music. The caller closes it. */
+  async newPage(): Promise<Page> {
+    await this.ensurePage();
+    return this.context!.newPage();
+  }
+
   async close(): Promise<void> {
     const context = this.context;
     this.context = undefined;
