@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { access, mkdir, stat } from "node:fs/promises";
+import { access, mkdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { chromium, type BrowserContext, type Download, type Locator, type Page } from "playwright-core";
@@ -8,7 +8,10 @@ import type { Config } from "./config.js";
 import { StateStore } from "./state.js";
 import type { AuthRecord, FlowMediaItem, PageInspection } from "./types.js";
 
-const FLOW_URL = "https://labs.google/fx/tools/flow";
+// Flow moved from labs.google/fx/tools/flow to flow.google.com; old URLs redirect.
+const FLOW_URL = "https://flow.google.com/";
+const FLOW_HOSTS = new Set(["flow.google.com", "labs.google"]);
+const isAssetMedia = (media: FlowMediaItem) => new URL(media.href).pathname.startsWith("/asb/");
 const CREDIT_ACTION = /^(generate|create|生成|制作|产生)(\s|$)/i;
 const BLOCKED_AUTH_ACTION = /(password|passkey|verification|验证码|验证|sign\s*out|log\s*out|退出登录|登出)/i;
 
@@ -124,6 +127,7 @@ export class FlowBrowserAdapter {
   async openMedia(input: { projectUrl: string; mediaId?: string; title?: string }): Promise<{ media: FlowMediaItem; page: PageInspection }> {
     await this.openFlowProject(input.projectUrl);
     const media = await this.findMedia(input);
+    if (isAssetMedia(media)) return { media, page: await this.inspectPage() };
     const page = await this.ensurePage();
     await page.goto(media.href, { waitUntil: "domcontentloaded", timeout: 45_000 });
     await page.getByRole("button", { name: /Download|下载/i }).first().waitFor({ state: "visible", timeout: 30_000 });
@@ -246,6 +250,22 @@ export class FlowBrowserAdapter {
   async downloadMedia(input: { projectUrl: string; mediaId?: string; title?: string; destinationDir: string; fileName?: string }): Promise<{ path: string; suggestedFileName: string; sourceUrl: string; media: FlowMediaItem; bytes: number }> {
     const { media } = await this.openMedia(input);
     const page = await this.ensurePage();
+    if (isAssetMedia(media)) {
+      // =d asks for the original file (same bytes as the editor's Download menu).
+      const response = await page.request.get(`${media.href}=d`);
+      if (!response.ok()) throw new Error(`Flow media download failed with HTTP ${response.status()}.`);
+      const extension = (response.headers()["content-type"] ?? "").split(";")[0].split("/")[1]?.replace("jpeg", "jpg") || "bin";
+      const suggestedFileName = `${media.tileId.slice(0, 24)}.${extension}`;
+      const requestedName = input.fileName ? path.basename(input.fileName) : suggestedFileName;
+      if (!requestedName || requestedName === "." || requestedName === "..") throw new Error("Invalid download file name.");
+      const destinationDir = path.resolve(input.destinationDir);
+      await mkdir(destinationDir, { recursive: true });
+      const destination = path.join(destinationDir, requestedName);
+      const body = await response.body();
+      if (!body.length) throw new Error("Flow download completed with an empty file.");
+      await writeFile(destination, body);
+      return { path: destination, suggestedFileName, sourceUrl: media.href, media, bytes: body.length };
+    }
     const downloadControl = page.getByRole("button", { name: /Download|下载/i }).first();
     if (!(await downloadControl.isVisible().catch(() => false))) throw new Error("Flow media detail page does not expose a visible Download control.");
     let download = await Promise.all([
@@ -284,7 +304,7 @@ export class FlowBrowserAdapter {
       });
     }
     if (!this.page || this.page.isClosed()) {
-      this.page = this.context.pages().find((candidate) => candidate.url().includes("labs.google")) ?? this.context.pages()[0] ?? await this.context.newPage();
+      this.page = this.context.pages().find((candidate) => FLOW_HOSTS.has(new URL(candidate.url()).hostname)) ?? this.context.pages()[0] ?? await this.context.newPage();
     }
     return this.page;
   }
@@ -323,6 +343,15 @@ export class FlowBrowserAdapter {
         if (item.tileId && item.href) results.push(item);
       }
     }
+    // flow.google.com has no data-tile-id tiles; media are /asb/ assets keyed by their asset token.
+    // shortcut: video assets are assumed to use the same /asb/ src; verify on the first video job.
+    results.push(...await page.locator("img[src*='/asb/'], video[src*='/asb/']").evaluateAll((elements) => elements.map((element) => {
+      const href = new URL(element.getAttribute("src") ?? "", location.origin);
+      href.pathname = href.pathname.replace(/=[^/]*$/, "");
+      const tileId = href.pathname.split("/").at(-1) ?? "";
+      const kind = element.tagName === "VIDEO" ? "video" as const : "image" as const;
+      return { tileId, providerMediaId: tileId, title: element.getAttribute("alt") || tileId, kind, href: `${href.origin}${href.pathname}` };
+    })));
     return [...new Map(results.map((item) => [item.href, item])).values()];
   }
 
@@ -355,7 +384,8 @@ export class FlowBrowserAdapter {
 
   private validateFlowProjectUrl(projectUrl: string): void {
     const url = new URL(projectUrl);
-    if (url.protocol !== "https:" || url.hostname !== "labs.google" || !url.pathname.startsWith("/fx/tools/flow/project/")) {
+    const projectPath = url.hostname === "flow.google.com" ? "/project/" : "/fx/tools/flow/project/";
+    if (url.protocol !== "https:" || !FLOW_HOSTS.has(url.hostname) || !url.pathname.startsWith(projectPath)) {
       throw new Error("Only official Google Flow project URLs are allowed.");
     }
   }
@@ -363,7 +393,7 @@ export class FlowBrowserAdapter {
   private async detectAuthentication(): Promise<"login_required" | "signed_in"> {
     const page = await this.ensurePage();
     const hostname = new URL(page.url()).hostname;
-    if (hostname === "accounts.google.com" || hostname !== "labs.google") return "login_required";
+    if (!FLOW_HOSTS.has(hostname)) return "login_required";
     const signInLinks = page.locator("a[href*='accounts.google.com']").filter({ hasText: /sign in|登录|登入/i });
     return await signInLinks.count() ? "login_required" : "signed_in";
   }
